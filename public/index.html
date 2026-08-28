@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>storybook-gen · 文本转有声书</title>
+<style>
+  :root {
+    --bg: #f6f4ef;
+    --card: #ffffff;
+    --ink: #2d2a26;
+    --muted: #8a857d;
+    --accent: #c96f4a;
+    --accent-soft: #f3e2d8;
+    --ok: #4a7a5c;
+    --err: #b04a3a;
+    --line: #e7e2d9;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    line-height: 1.6;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 20px 60px; }
+  header { margin-bottom: 24px; }
+  header h1 { font-size: 22px; font-weight: 700; letter-spacing: .5px; }
+  header p { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .card h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+  .badge {
+    display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    background: var(--accent-soft); color: var(--accent); font-weight: 600;
+  }
+  .badge.ok { background: #e4efe7; color: var(--ok); }
+  .badge.err { background: #f6e3df; color: var(--err); }
+  .row { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
+  .row:last-child { margin-bottom: 0; }
+  label { font-size: 13px; color: var(--muted); width: 72px; flex-shrink: 0; }
+  input[type=text], input[type=password], select, textarea {
+    flex: 1; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+    font-size: 13px; background: #fff; color: var(--ink); outline: none; font-family: inherit;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  textarea { min-height: 90px; resize: vertical; }
+  button {
+    padding: 8px 16px; border: none; border-radius: 8px; background: var(--accent); color: #fff;
+    font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit;
+  }
+  button:hover { filter: brightness(1.05); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.ghost { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
+  .progress-wrap { margin-top: 14px; display: none; }
+  .progress-track { height: 8px; background: var(--line); border-radius: 999px; overflow: hidden; }
+  .progress-bar { height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width .3s; }
+  .status { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .file-input { flex: 1; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>📖 storybook-gen <span class="badge" id="providerBadge">加载中…</span></h1>
+    <p>文本转有声书 · 可插拔 TTS 引擎 · 上传 txt/md 生成 mp3</p>
+  </header>
+
+  <!-- 配置卡片 -->
+  <div class="card">
+    <h2>⚙️ 配置 <span id="configBadge" class="badge err">未配置 Key</span></h2>
+    <div class="row">
+      <label>API Key</label>
+      <input type="password" id="apiKeyInput" placeholder="platform.xiaomimimo.com 控制台获取 MiMo API Key" autocomplete="off">
+      <button id="saveKeyBtn">保存</button>
+    </div>
+    <p class="hint">Key 仅保存在本地 <code>.env</code> 文件，不写入源码、不上传任何服务器。</p>
+  </div>
+
+  <!-- 转换卡片 -->
+  <div class="card">
+    <h2>🎙️ 转换</h2>
+    <div class="row">
+      <label>音色</label>
+      <select id="voiceSelect"></select>
+    </div>
+    <div class="row" style="align-items:flex-start;">
+      <label>语气指令</label>
+      <textarea id="styleInput" placeholder="可选。例如：用四川话说这句话 / 语气要温柔一些…"></textarea>
+    </div>
+    <div class="row">
+      <label>文件</label>
+      <input type="file" id="fileInput" class="file-input" accept=".txt,.md">
+    </div>
+    <div class="row">
+      <label>或粘贴</label>
+      <textarea id="textInput" placeholder="直接粘贴正文，与上传文件二选一"></textarea>
+    </div>
+    <div class="row">
+      <button id="convertBtn">开始转换</button>
+      <span class="hint">整章文本即可，系统自动拆句逐段合成</span>
+    </div>
+    <div class="progress-wrap" id="progressWrap">
+      <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+      <div class="status" id="statusText">准备就绪</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let voices = [];
+let convertedFileName = 'storybook';
+
+// ---------- 状态加载 ----------
+async function loadStatus() {
+  const res = await fetch('/api/status');
+  const data = await res.json();
+  $('providerBadge').textContent = data.current.toUpperCase();
+  const provider = data.providers.find((p) => p.id === data.current);
+  const cfg = provider?.configured;
+  $('configBadge').textContent = cfg ? '已配置 Key' : '未配置 Key';
+  $('configBadge').className = 'badge ' + (cfg ? 'ok' : 'err');
+  if (provider?.configured) $('apiKeyInput').placeholder = 'Key 已保存，如需更换请重新填写';
+
+  voices = await fetchVoices();
+  fillVoices(data.defaultVoice);
+}
+
+async function fetchVoices() {
+  // 音色列表：此处用 mimo 精品音色；多 provider 场景可从后端 /api/status 扩展
+  return [
+    { id: '茉莉', label: '茉莉 · 温婉女声' },
+    { id: '冰糖', label: '冰糖 · 清亮女声' },
+    { id: '苏打', label: '苏打 · 清爽女声' },
+    { id: '白桦', label: '白桦 · 沉稳' },
+    { id: 'Mia', label: 'Mia · 英文女声' },
+    { id: 'Chloe', label: 'Chloe · 英文女声' },
+    { id: 'Milo', label: 'Milo · 英文男声' },
+    { id: 'Dean', label: 'Dean · 英文男声' },
+  ];
+}
+
+function fillVoices(defaultVoice) {
+  const sel = $('voiceSelect');
+  sel.innerHTML = '';
+  voices.forEach((v) => {
+    const opt = document.createElement('option');
+    opt.value = v.id;
+    opt.textContent = v.label;
+    sel.appendChild(opt);
+  });
+  sel.value = defaultVoice;
+}
+
+// ---------- 保存 API Key ----------
+$('saveKeyBtn').addEventListener('click', async () => {
+  const apiKey = $('apiKeyInput').value.trim();
+  if (!apiKey) { alert('请输入 API Key'); return; }
+  $('saveKeyBtn').disabled = true;
+  try {
+    const res = await fetch('/api/config/apikey', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'mimo', apiKey }),
+    });
+    if (!res.ok) throw new Error((await res.json()).error || '保存失败');
+    $('apiKeyInput').value = '';
+    $('configBadge').textContent = '已配置 Key';
+    $('configBadge').className = 'badge ok';
+    $('apiKeyInput').placeholder = 'Key 已保存，如需更换请重新填写';
+    alert('API Key 已保存到 .env');
+  } catch (err) {
+    alert('保存失败：' + err.message);
+  } finally {
+    $('saveKeyBtn').disabled = false;
+  }
+});
+
+// ---------- 转换 ----------
+$('convertBtn').addEventListener('click', async () => {
+  const file = $('fileInput').files[0];
+  const pasted = $('textInput').value.trim();
+  if (!file && !pasted) { alert('请上传文件或粘贴文本'); return; }
+
+  const voice = $('voiceSelect').value;
+  const style = $('styleInput').value.trim();
+  const form = new FormData();
+  form.append('voice', voice);
+  if (style) form.append('style', style);
+  if (file) { form.append('file', file); convertedFileName = file.name; }
+  else { form.append('text', pasted); convertedFileName = 'pasted'; }
+
+  $('convertBtn').disabled = true;
+  $('progressWrap').style.display = 'block';
+  $('progressBar').style.width = '0%';
+  $('statusText').textContent = '准备中…';
+
+  const url = file ? '/api/convert/file' : '/api/convert';
+  const timer = setInterval(pollProgress, 800);
+  try {
+    const res = await fetch(url, { method: 'POST', body: form });
+    if (!res.ok) throw new Error((await res.json()).error || '转换失败');
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = convertedFileName.replace(/\.(txt|md)$/i, '') + '.mp3';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    $('statusText').textContent = '完成，已开始下载';
+    $('progressBar').style.width = '100%';
+  } catch (err) {
+    $('statusText').textContent = '失败：' + err.message;
+  } finally {
+    clearInterval(timer);
+    $('convertBtn').disabled = false;
+  }
+});
+
+async function pollProgress() {
+  try {
+    const res = await fetch('/api/progress');
+    const data = await res.json();
+    if (data.total > 0) {
+      $('progressBar').style.width = Math.round((data.done / data.total) * 100) + '%';
+    }
+    $('statusText').textContent = data.status;
+  } catch { /* 轮询失败忽略 */ }
+}
+
+loadStatus();
+</script>
+</body>
+</html>
