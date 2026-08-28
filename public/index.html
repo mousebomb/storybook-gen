@@ -64,18 +64,39 @@
   .status { font-size: 12px; color: var(--muted); margin-top: 8px; }
   .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
   .file-input { flex: 1; font-size: 13px; }
+  /* 开关样式 */
+  .switch-row { display: flex; align-items: center; gap: 10px; }
+  .switch { position: relative; width: 40px; height: 22px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; inset: 0; background: var(--line); border-radius: 999px;
+    cursor: pointer; transition: background .2s;
+  }
+  .slider::before {
+    content: ''; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px;
+    background: #fff; border-radius: 50%; transition: transform .2s;
+  }
+  .switch input:checked + .slider { background: var(--accent); }
+  .switch input:checked + .slider::before { transform: translateX(18px); }
+  .switch input:disabled + .slider { opacity: .5; cursor: not-allowed; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <h1>📖 storybook-gen <span class="badge" id="providerBadge">加载中…</span></h1>
-    <p>文本转有声书 · 可插拔 TTS 引擎 · 上传 txt/md 生成 mp3</p>
+    <p>文本转有声书 · 可插拔 TTS 引擎 · LLM 自动语气拆解 · 上传 txt/md 生成 mp3</p>
   </header>
 
-  <!-- 配置卡片 -->
+  <!-- TTS 配置卡片 -->
   <div class="card">
-    <h2>⚙️ 配置 <span id="configBadge" class="badge err">未配置 Key</span></h2>
+    <h2>🎙️ TTS 配置 <span id="ttsBadge" class="badge err">未配置 Key</span></h2>
+    <div class="row">
+      <label>引擎</label>
+      <select id="providerSelect">
+        <option value="mimo">小米 MiMo TTS（mimo-v2.5-tts）</option>
+      </select>
+    </div>
     <div class="row">
       <label>API Key</label>
       <input type="password" id="apiKeyInput" placeholder="platform.xiaomimimo.com 控制台获取 MiMo API Key" autocomplete="off">
@@ -84,16 +105,43 @@
     <p class="hint">Key 仅保存在本地 <code>.env</code> 文件，不写入源码、不上传任何服务器。</p>
   </div>
 
+  <!-- LLM 配置卡片 -->
+  <div class="card">
+    <h2>🤖 LLM 配置（自动语气） <span id="llmBadge" class="badge err">未配置</span></h2>
+    <div class="row">
+      <label>Base URL</label>
+      <input type="text" id="llmBaseUrlInput" placeholder="OpenAI 兼容接口，如 https://api.openai.com/v1" autocomplete="off">
+    </div>
+    <div class="row">
+      <label>API Key</label>
+      <input type="password" id="llmApiKeyInput" placeholder="LLM API Key（留空表示不修改）" autocomplete="off">
+    </div>
+    <div class="row">
+      <label>Model</label>
+      <input type="text" id="llmModelInput" placeholder="如 gpt-4o-mini / deepseek-chat" autocomplete="off">
+      <button id="saveLlmBtn">保存</button>
+    </div>
+    <div class="row switch-row">
+      <label>自动语气</label>
+      <!-- 用 label 包裹开关：点击滑块才能触发隐藏的 checkbox -->
+      <label class="switch" for="autoStyleToggle">
+        <input type="checkbox" id="autoStyleToggle" disabled>
+        <span class="slider"></span>
+      </label>
+      <span class="hint" id="autoStyleHint" style="margin-top:0;">开启后：LLM 自动拆解文本并逐段生成语气指令（需先配置并保存 LLM）</span>
+    </div>
+  </div>
+
   <!-- 转换卡片 -->
   <div class="card">
-    <h2>🎙️ 转换</h2>
+    <h2>📚 转换 <span id="autoStyleBadge" class="badge" style="display:none;">自动语气：开</span></h2>
     <div class="row">
       <label>音色</label>
       <select id="voiceSelect"></select>
     </div>
     <div class="row" style="align-items:flex-start;">
       <label>语气指令</label>
-      <textarea id="styleInput" placeholder="可选。例如：用四川话说这句话 / 语气要温柔一些…"></textarea>
+      <textarea id="styleInput" placeholder="可选，全局兜底。自动语气开启时仅对无指令的段生效"></textarea>
     </div>
     <div class="row">
       <label>文件</label>
@@ -118,20 +166,46 @@
 const $ = (id) => document.getElementById(id);
 let voices = [];
 let convertedFileName = 'storybook';
+let llmConfigured = false;
 
 // ---------- 状态加载 ----------
 async function loadStatus() {
   const res = await fetch('/api/status');
   const data = await res.json();
   $('providerBadge').textContent = data.current.toUpperCase();
+  $('providerSelect').value = data.current;
+
+  // TTS 配置状态
   const provider = data.providers.find((p) => p.id === data.current);
   const cfg = provider?.configured;
-  $('configBadge').textContent = cfg ? '已配置 Key' : '未配置 Key';
-  $('configBadge').className = 'badge ' + (cfg ? 'ok' : 'err');
-  if (provider?.configured) $('apiKeyInput').placeholder = 'Key 已保存，如需更换请重新填写';
+  $('ttsBadge').textContent = cfg ? '已配置 Key' : '未配置 Key';
+  $('ttsBadge').className = 'badge ' + (cfg ? 'ok' : 'err');
+  if (cfg) $('apiKeyInput').placeholder = 'Key 已保存，如需更换请重新填写';
+
+  // LLM 配置状态（key 不回传，仅回传 baseUrl/model）
+  llmConfigured = !!data.llm?.configured;
+  $('llmBadge').textContent = llmConfigured ? '已配置' : '未配置';
+  $('llmBadge').className = 'badge ' + (llmConfigured ? 'ok' : 'err');
+  if (data.llm?.baseUrl) $('llmBaseUrlInput').placeholder = data.llm.baseUrl;
+  if (data.llm?.model) $('llmModelInput').placeholder = data.llm.model;
+  if (llmConfigured) $('llmApiKeyInput').placeholder = 'Key 已保存，留空表示不修改';
+
+  // 自动语气开关：LLM 未配置时置灰
+  const toggle = $('autoStyleToggle');
+  toggle.disabled = !llmConfigured;
+  toggle.checked = !!data.llm?.autoStyleEnabled;
+  $('autoStyleHint').textContent = llmConfigured
+    ? '开启后：LLM 自动拆解文本并逐段生成语气指令，驱动 TTS 带语气朗读'
+    : '开启后：LLM 自动拆解文本并逐段生成语气指令（需先配置并保存 LLM）';
+  updateAutoStyleBadge();
 
   voices = await fetchVoices();
   fillVoices(data.defaultVoice);
+}
+
+function updateAutoStyleBadge() {
+  const on = llmConfigured && $('autoStyleToggle').checked;
+  $('autoStyleBadge').style.display = on ? '' : 'none';
 }
 
 async function fetchVoices() {
@@ -160,7 +234,7 @@ function fillVoices(defaultVoice) {
   sel.value = defaultVoice;
 }
 
-// ---------- 保存 API Key ----------
+// ---------- 保存 TTS API Key ----------
 $('saveKeyBtn').addEventListener('click', async () => {
   const apiKey = $('apiKeyInput').value.trim();
   if (!apiKey) { alert('请输入 API Key'); return; }
@@ -169,18 +243,66 @@ $('saveKeyBtn').addEventListener('click', async () => {
     const res = await fetch('/api/config/apikey', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: 'mimo', apiKey }),
+      body: JSON.stringify({ provider: $('providerSelect').value, apiKey }),
     });
     if (!res.ok) throw new Error((await res.json()).error || '保存失败');
     $('apiKeyInput').value = '';
-    $('configBadge').textContent = '已配置 Key';
-    $('configBadge').className = 'badge ok';
+    $('ttsBadge').textContent = '已配置 Key';
+    $('ttsBadge').className = 'badge ok';
     $('apiKeyInput').placeholder = 'Key 已保存，如需更换请重新填写';
-    alert('API Key 已保存到 .env');
+    alert('TTS API Key 已保存到 .env');
   } catch (err) {
     alert('保存失败：' + err.message);
   } finally {
     $('saveKeyBtn').disabled = false;
+  }
+});
+
+// ---------- 保存 LLM 配置 ----------
+$('saveLlmBtn').addEventListener('click', async () => {
+  const baseUrl = $('llmBaseUrlInput').value.trim();
+  const model = $('llmModelInput').value.trim();
+  if (!baseUrl) { alert('请输入 Base URL'); return; }
+  if (!model) { alert('请输入 Model'); return; }
+  $('saveLlmBtn').disabled = true;
+  try {
+    const res = await fetch('/api/config/llm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey: $('llmApiKeyInput').value.trim(), baseUrl, model }),
+    });
+    if (!res.ok) throw new Error((await res.json()).error || '保存失败');
+    $('llmApiKeyInput').value = '';
+    llmConfigured = true;
+    $('llmBadge').textContent = '已配置';
+    $('llmBadge').className = 'badge ok';
+    $('llmApiKeyInput').placeholder = 'Key 已保存，留空表示不修改';
+    $('llmBaseUrlInput').placeholder = baseUrl;
+    $('llmModelInput').placeholder = model;
+    $('autoStyleToggle').disabled = false;
+    $('autoStyleHint').textContent = '开启后：LLM 自动拆解文本并逐段生成语气指令，驱动 TTS 带语气朗读';
+    alert('LLM 配置已保存到 .env');
+  } catch (err) {
+    alert('保存失败：' + err.message);
+  } finally {
+    $('saveLlmBtn').disabled = false;
+  }
+});
+
+// ---------- 自动语气开关 ----------
+$('autoStyleToggle').addEventListener('change', async (e) => {
+  const enabled = e.target.checked;
+  try {
+    const res = await fetch('/api/config/autostyle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!res.ok) throw new Error((await res.json()).error || '切换失败');
+    updateAutoStyleBadge();
+  } catch (err) {
+    e.target.checked = !enabled; // 失败回滚开关状态
+    alert('切换失败：' + err.message);
   }
 });
 
@@ -192,9 +314,12 @@ $('convertBtn').addEventListener('click', async () => {
 
   const voice = $('voiceSelect').value;
   const style = $('styleInput').value.trim();
+  // 自动语气开启时随请求下发（后端仍会校验 LLM 可用性，不可用则自动走旧流程）
+  const autoStyle = llmConfigured && $('autoStyleToggle').checked;
   const form = new FormData();
   form.append('voice', voice);
   if (style) form.append('style', style);
+  if (autoStyle) form.append('autoStyle', 'true');
   if (file) { form.append('file', file); convertedFileName = file.name; }
   else { form.append('text', pasted); convertedFileName = 'pasted'; }
 

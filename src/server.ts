@@ -6,6 +6,7 @@ import path from 'node:path';
 import { getProvider, listProviders } from './providers';
 import { getEnv, saveEnv } from './config';
 import { textToAudio } from './pipeline';
+import { isLlmConfigured } from './llm';
 
 const PORT = Number(getEnv('PORT') ?? '5666');
 const PUBLIC_DIR = path.join(process.cwd(), 'public');
@@ -16,7 +17,7 @@ await app.register(multipart);
 // 当前转换进度（内存态，同时只跑一个任务）
 const progress = { running: false, done: 0, total: 0, status: '空闲' };
 
-// 状态查询：返回所有 provider、当前选中项、key 是否已配置
+// 状态查询：返回所有 provider、当前选中项、key 是否已配置、LLM 配置状态
 app.get('/api/status', async () => ({
   providers: listProviders().map((p) => ({
     id: p.id,
@@ -26,6 +27,13 @@ app.get('/api/status', async () => ({
   })),
   current: getEnv('TTS_PROVIDER') ?? 'mimo',
   defaultVoice: getEnv('MIMO_VOICE') ?? '茉莉',
+  llm: {
+    configured: isLlmConfigured(),
+    // 脱敏展示：只回传 baseUrl 与 model，不回传 key
+    baseUrl: getEnv('LLM_BASE_URL') ?? '',
+    model: getEnv('LLM_MODEL') ?? '',
+    autoStyleEnabled: getEnv('AUTO_STYLE_ENABLED') === 'true',
+  },
 }));
 
 // 保存 API Key 到 .env（不硬编码到源码），同时刷新进程内变量
@@ -42,12 +50,45 @@ app.post('/api/config/apikey', async (req, reply) => {
   return { ok: true };
 });
 
+// 保存 LLM（OpenAI 兼容）配置：key 为空表示保留旧值，baseUrl/model 必填
+app.post('/api/config/llm', async (req, reply) => {
+  const body = req.body as { apiKey?: string; baseUrl?: string; model?: string } | null;
+  const apiKey = body?.apiKey?.trim() ?? '';
+  const baseUrl = body?.baseUrl?.trim() ?? '';
+  const model = body?.model?.trim() ?? '';
+
+  if (!baseUrl) return reply.code(400).send({ error: 'Base URL 不能为空' });
+  if (!model) return reply.code(400).send({ error: 'Model 不能为空' });
+
+  const patch: Record<string, string> = { LLM_BASE_URL: baseUrl, LLM_MODEL: model };
+  if (apiKey) patch.LLM_API_KEY = apiKey; // key 留空则沿用 .env 里的旧值
+  saveEnv(patch);
+  if (apiKey) process.env.LLM_API_KEY = apiKey;
+  process.env.LLM_BASE_URL = baseUrl;
+  process.env.LLM_MODEL = model;
+  return { ok: true };
+});
+
+// 切换自动语气开关（该功能依赖 LLM 已配置）
+app.post('/api/config/autostyle', async (req, reply) => {
+  const body = req.body as { enabled?: boolean } | null;
+  const enabled = !!body?.enabled;
+  if (enabled && !isLlmConfigured()) {
+    return reply.code(400).send({ error: '请先配置 LLM（Base URL / API Key / Model）' });
+  }
+  saveEnv({ AUTO_STYLE_ENABLED: enabled ? 'true' : 'false' });
+  process.env.AUTO_STYLE_ENABLED = enabled ? 'true' : 'false';
+  return { ok: true, enabled };
+});
+
 app.get('/api/progress', async () => progress);
 
 // JSON 文本转换：直接提交正文
 app.post('/api/convert', async (req, reply) => {
   if (progress.running) return reply.code(409).send({ error: '已有任务在转换中，请等待完成' });
-  const body = req.body as { text?: string; voice?: string; style?: string; speed?: number; gapMs?: number } | null;
+  const body = req.body as {
+    text?: string; voice?: string; style?: string; speed?: number; gapMs?: number; autoStyle?: boolean;
+  } | null;
   const text = body?.text?.trim();
   if (!text) return reply.code(400).send({ error: '缺少待转换文本' });
 
@@ -56,6 +97,7 @@ app.post('/api/convert', async (req, reply) => {
     style: body?.style,
     speed: body?.speed,
     gapMs: body?.gapMs,
+    autoStyle: body?.autoStyle,
   });
 });
 
@@ -67,6 +109,7 @@ app.post('/api/convert/file', async (req, reply) => {
   let filename = '';
   let voice: string | undefined;
   let style: string | undefined;
+  let autoStyle = false;
 
   for await (const part of req.parts()) {
     if (part.type === 'file') {
@@ -77,18 +120,20 @@ app.post('/api/convert/file', async (req, reply) => {
       voice = String(part.value);
     } else if (part.fieldname === 'style') {
       style = String(part.value);
+    } else if (part.fieldname === 'autoStyle') {
+      autoStyle = String(part.value) === 'true';
     }
   }
 
   if (!text.trim()) return reply.code(400).send({ error: '上传文件为空或无法读取' });
-  return runConversion(reply, text, { voice, style }, filename);
+  return runConversion(reply, text, { voice, style, autoStyle }, filename);
 });
 
 /** 执行转换并返回 mp3 响应；统一处理进度与错误 */
 async function runConversion(
   reply: FastifyReply,
   text: string,
-  opts: { voice?: string; style?: string; speed?: number; gapMs?: number },
+  opts: { voice?: string; style?: string; speed?: number; gapMs?: number; autoStyle?: boolean },
   filename = 'storybook.mp3',
 ) {
   const provider = getProvider();
@@ -103,6 +148,10 @@ async function runConversion(
         progress.done = done;
         progress.total = total;
         progress.status = `合成中 ${done}/${total}`;
+      },
+      // LLM 拆解等阶段性状态（此时 done/total 还未产生）
+      onStatus: (msg) => {
+        if (!progress.done) progress.status = msg;
       },
     });
     progress.status = '完成';
