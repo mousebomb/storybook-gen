@@ -1,8 +1,9 @@
-/** storybook-gen 服务入口：Fastify + WebUI + 转换 API */
-import Fastify, { type FastifyReply } from 'fastify';
+/** storybook-gen 服务入口：Fastify + WebUI + 批量转换队列 API */
+import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { getProvider, listProviders } from './providers';
 import { getEnv, saveEnv } from './config';
 import { textToAudio } from './pipeline';
@@ -10,12 +11,39 @@ import { isLlmConfigured } from './llm';
 
 const PORT = Number(getEnv('PORT') ?? '5666');
 const PUBLIC_DIR = path.join(process.cwd(), 'public');
+/** 产物目录 */
+const OUTPUT_DIR = path.join(process.cwd(), 'output');
+/** 上传文件暂存目录（挂在 output/ 下，天然被 .gitignore 覆盖） */
+const STAGING_DIR = path.join(OUTPUT_DIR, '.tmp');
 
-const app = Fastify({ bodyLimit: 20 * 1024 * 1024 });
+// bodyLimit 调大到 100MB：单本小说 txt 可能超过默认 20MB
+const app = Fastify({ bodyLimit: 100 * 1024 * 1024 });
 await app.register(multipart);
 
-// 当前转换进度（内存态，同时只跑一个任务）
-const progress = { running: false, done: 0, total: 0, status: '空闲' };
+// 启动时清空暂存目录：队列仅存内存，重启后残留的上传文件已无对应任务
+fs.rmSync(STAGING_DIR, { recursive: true, force: true });
+fs.mkdirSync(STAGING_DIR, { recursive: true });
+fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+
+/** 批量转换任务（内存态队列）：按入队顺序串行执行，单个失败不中断后续 */
+interface ConvertTask {
+  id: string;
+  /** 原始文件名（决定输出 mp3 命名 + 队列展示） */
+  filename: string;
+  /** 暂存文件路径，转换时读入内存后立即删除，避免上百文件占内存 */
+  filePath: string;
+  voice?: string;
+  style?: string;
+  autoStyle?: boolean;
+  status: 'pending' | 'running' | 'done' | 'failed';
+  error?: string;
+}
+
+const queue: ConvertTask[] = [];
+/** worker 是否在跑（保证只有一个消费循环） */
+let workerRunning = false;
+// 当前任务的段级进度（内存态，供前端轮询）
+const progress = { done: 0, total: 0, status: '空闲' };
 
 // 状态查询：返回所有 provider、当前选中项、key 是否已配置、LLM 配置状态
 app.get('/api/status', async () => ({
@@ -81,41 +109,51 @@ app.post('/api/config/autostyle', async (req, reply) => {
   return { ok: true, enabled };
 });
 
-app.get('/api/progress', async () => progress);
+// 进度与队列状态查询：前端轮询渲染（done/failed/pending 为任务级统计）
+app.get('/api/progress', async () => {
+  const tasks = queue.map(({ id, filename, status, error }) => ({ id, filename, status, error }));
+  return {
+    status: progress.status,
+    segDone: progress.done,
+    segTotal: progress.total,
+    pending: tasks.filter((t) => t.status === 'pending').length,
+    done: tasks.filter((t) => t.status === 'done').length,
+    failed: tasks.filter((t) => t.status === 'failed').length,
+    tasks,
+  };
+});
 
-// JSON 文本转换：直接提交正文
+// JSON 文本转换：正文写入暂存后入队（与文件上传走同一条队列，不回传 mp3）
 app.post('/api/convert', async (req, reply) => {
-  if (progress.running) return reply.code(409).send({ error: '已有任务在转换中，请等待完成' });
   const body = req.body as {
-    text?: string; voice?: string; style?: string; speed?: number; gapMs?: number; autoStyle?: boolean;
+    text?: string; voice?: string; style?: string; autoStyle?: boolean;
   } | null;
   const text = body?.text?.trim();
   if (!text) return reply.code(400).send({ error: '缺少待转换文本' });
 
-  return runConversion(reply, text, {
+  enqueueTask({
+    filename: `pasted-${stamp()}.txt`,
+    filePath: stageText(text),
     voice: body?.voice,
     style: body?.style,
-    speed: body?.speed,
-    gapMs: body?.gapMs,
     autoStyle: body?.autoStyle,
   });
+  return { ok: true };
 });
 
-// 文件上传转换：上传 txt/md 文件
+// 文件上传转换：单请求支持多文件，全部入队后立即返回（不阻塞、不触发下载）
 app.post('/api/convert/file', async (req, reply) => {
-  if (progress.running) return reply.code(409).send({ error: '已有任务在转换中，请等待完成' });
-
-  let text = '';
-  let filename = '';
+  const files: { filename: string; text: string }[] = [];
   let voice: string | undefined;
   let style: string | undefined;
   let autoStyle = false;
 
   for await (const part of req.parts()) {
     if (part.type === 'file') {
-      filename = part.filename;
       const buf = await part.toBuffer();
-      text = buf.toString('utf-8');
+      const text = buf.toString('utf-8');
+      // 空文件直接跳过，不阻塞整批
+      if (text.trim()) files.push({ filename: part.filename, text });
     } else if (part.fieldname === 'voice') {
       voice = String(part.value);
     } else if (part.fieldname === 'style') {
@@ -125,52 +163,117 @@ app.post('/api/convert/file', async (req, reply) => {
     }
   }
 
-  if (!text.trim()) return reply.code(400).send({ error: '上传文件为空或无法读取' });
-  return runConversion(reply, text, { voice, style, autoStyle }, filename);
+  if (!files.length) return reply.code(400).send({ error: '上传文件为空或无法读取' });
+  for (const f of files) {
+    enqueueTask({
+      filename: f.filename,
+      filePath: stageText(f.text),
+      voice, style, autoStyle,
+    });
+  }
+  return { ok: true, enqueued: files.length };
 });
 
-/** 执行转换并返回 mp3 响应；统一处理进度与错误 */
-async function runConversion(
-  reply: FastifyReply,
-  text: string,
-  opts: { voice?: string; style?: string; speed?: number; gapMs?: number; autoStyle?: boolean },
-  filename = 'storybook.mp3',
-) {
-  const provider = getProvider();
-  progress.running = true;
-  progress.done = 0;
-  progress.total = 0;
-  progress.status = '准备中…';
-  try {
-    const mp3 = await textToAudio(provider, text, {
-      ...opts,
-      onProgress: (done, total) => {
-        progress.done = done;
-        progress.total = total;
-        progress.status = `合成中 ${done}/${total}`;
-      },
-      // LLM 拆解等阶段性状态（此时 done/total 还未产生）
-      onStatus: (msg) => {
-        if (!progress.done) progress.status = msg;
-      },
-    });
-    progress.status = '完成';
-    // 结果同时落盘到 output/：客户端断开也不丢，便于整本挂机批量生成
-    const outDir = path.join(process.cwd(), 'output');
-    fs.mkdirSync(outDir, { recursive: true });
-    const downloadName = filename.replace(/\.(txt|md)$/i, '') + '.mp3';
-    fs.writeFileSync(path.join(outDir, downloadName), mp3);
-    // 中文文件名需 RFC 5987 编码，否则 Fastify 拒绝非 ASCII header
-    return reply
-      .header('Content-Type', 'audio/mpeg')
-      .header('Content-Disposition', `attachment; filename="storybook.mp3"; filename*=UTF-8''${encodeURIComponent(downloadName)}`)
-      .send(mp3);
-  } catch (err) {
-    progress.status = `失败：${(err as Error).message}`;
-    return reply.code(500).send({ error: (err as Error).message });
-  } finally {
-    progress.running = false;
+// 产物列表：读取 output/ 下的 mp3，按修改时间倒序（最新产出在前）
+app.get('/api/output', async () => {
+  const files = fs.readdirSync(OUTPUT_DIR)
+    .filter((f) => f.endsWith('.mp3'))
+    .map((f) => {
+      const st = fs.statSync(path.join(OUTPUT_DIR, f));
+      return { name: f, size: st.size, mtime: st.mtimeMs };
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+  return { files };
+});
+
+// 产物下载：中文文件名需 RFC 5987 编码，否则 Fastify 拒绝非 ASCII header
+app.get('/api/output/:name', async (req, reply) => {
+  const { name } = req.params as { name: string };
+  // path.basename 防目录穿越；只允许下载 mp3
+  const safeName = path.basename(name);
+  const file = path.join(OUTPUT_DIR, safeName);
+  if (!safeName.endsWith('.mp3') || !fs.existsSync(file)) {
+    return reply.code(404).send({ error: '文件不存在' });
   }
+  return reply
+    .header('Content-Type', 'audio/mpeg')
+    .header('Content-Disposition', `attachment; filename="audio.mp3"; filename*=UTF-8''${encodeURIComponent(safeName)}`)
+    .send(fs.readFileSync(file));
+});
+
+/** 入队一个转换任务并确保 worker 在跑 */
+function enqueueTask(t: Pick<ConvertTask, 'filename' | 'filePath' | 'voice' | 'style' | 'autoStyle'>) {
+  const task: ConvertTask = { ...t, id: randomUUID().slice(0, 8), status: 'pending' };
+  queue.push(task);
+  void processQueue();
+  return task;
+}
+
+/** 队列消费循环：串行处理所有 pending 任务，全部处理完后退出 */
+async function processQueue() {
+  if (workerRunning) return;
+  workerRunning = true;
+  try {
+    while (true) {
+      // 取最早的 pending 任务（入队顺序即执行顺序）
+      const task = queue.find((t) => t.status === 'pending');
+      if (!task) break;
+      task.status = 'running';
+      progress.done = 0;
+      progress.total = 0;
+      progress.status = `转换中 · ${task.filename}`;
+      try {
+        // 暂存文件读入内存后立即删除，控制暂存目录大小
+        const text = fs.readFileSync(task.filePath, 'utf-8');
+        fs.rmSync(task.filePath, { force: true });
+        const mp3 = await textToAudio(getProvider(), text, {
+          voice: task.voice,
+          style: task.style,
+          autoStyle: task.autoStyle,
+          onProgress: (done, total) => {
+            progress.done = done;
+            progress.total = total;
+            progress.status = `合成中 ${done}/${total} · ${task.filename}`;
+          },
+          // LLM 拆解等阶段性状态（此时段级进度还没产生）
+          onStatus: (msg) => {
+            if (!progress.done) progress.status = `${msg} · ${task.filename}`;
+          },
+        });
+        // 产物落盘 output/：挂机批量生成，客户端断开不丢
+        fs.writeFileSync(path.join(OUTPUT_DIR, toMp3Name(task.filename)), mp3);
+        task.status = 'done';
+      } catch (err) {
+        // 单任务失败不中断队列，挂机模式继续下一个
+        task.status = 'failed';
+        task.error = (err as Error).message;
+      }
+    }
+    progress.done = 0;
+    progress.total = 0;
+    progress.status = queue.some((t) => t.status === 'failed') ? '队列完成（含失败任务）' : '队列完成';
+  } finally {
+    workerRunning = false;
+  }
+}
+
+/** 把文本写入暂存目录，返回暂存路径 */
+function stageText(text: string): string {
+  const p = path.join(STAGING_DIR, `${randomUUID()}.txt`);
+  fs.writeFileSync(p, text, 'utf-8');
+  return p;
+}
+
+/** 原始文件名 → 输出 mp3 文件名：去扩展名、替换非法字符 */
+function toMp3Name(filename: string): string {
+  return filename.replace(/\.(txt|md)$/i, '').replace(/[\\/:*?"<>|]/g, '_') + '.mp3';
+}
+
+/** 时间戳：用于粘贴文本的默认命名，如 20260828-153000 */
+function stamp(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
 // WebUI 静态页面

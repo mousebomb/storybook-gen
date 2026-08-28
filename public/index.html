@@ -58,12 +58,31 @@
   button:hover { filter: brightness(1.05); }
   button:disabled { opacity: .5; cursor: not-allowed; }
   button.ghost { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
-  .progress-wrap { margin-top: 14px; display: none; }
+  .progress-wrap { margin-top: 14px; }
   .progress-track { height: 8px; background: var(--line); border-radius: 999px; overflow: hidden; }
   .progress-bar { height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width .3s; }
   .status { font-size: 12px; color: var(--muted); margin-top: 8px; }
   .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
   .file-input { flex: 1; font-size: 13px; }
+  /* 队列任务列表 */
+  .queue-list { margin-top: 10px; max-height: 220px; overflow-y: auto; display: none; }
+  .task { display: flex; gap: 8px; align-items: baseline; font-size: 12px; padding: 3px 0; border-bottom: 1px dashed var(--line); }
+  .task:last-child { border-bottom: none; }
+  .task-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task.failed .task-name { color: var(--err); }
+  .task-badge {
+    flex-shrink: 0; width: 48px; text-align: center; font-size: 11px; padding: 1px 6px;
+    border-radius: 999px; background: var(--line); color: var(--muted);
+  }
+  .task.running .task-badge { background: var(--accent-soft); color: var(--accent); }
+  .task.done .task-badge { background: #e4efe7; color: var(--ok); }
+  .task.failed .task-badge { background: #f6e3df; color: var(--err); }
+  /* 产物列表 */
+  .output-list { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
+  .output-item { display: flex; align-items: baseline; gap: 10px; font-size: 13px; }
+  .output-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .output-size { color: var(--muted); font-size: 12px; flex-shrink: 0; }
+  .output-item a { color: var(--accent); text-decoration: none; font-size: 12px; flex-shrink: 0; }
   /* 开关样式 */
   .switch-row { display: flex; align-items: center; gap: 10px; }
   .switch { position: relative; width: 40px; height: 22px; flex-shrink: 0; }
@@ -85,7 +104,7 @@
 <div class="wrap">
   <header>
     <h1>📖 storybook-gen <span class="badge" id="providerBadge">加载中…</span></h1>
-    <p>文本转有声书 · 可插拔 TTS 引擎 · LLM 自动语气拆解 · 上传 txt/md 生成 mp3</p>
+    <p>文本转有声书 · 批量挂机转换 · 可插拔 TTS 引擎 · LLM 自动语气拆解</p>
   </header>
 
   <!-- TTS 配置卡片 -->
@@ -134,7 +153,7 @@
 
   <!-- 转换卡片 -->
   <div class="card">
-    <h2>📚 转换 <span id="autoStyleBadge" class="badge" style="display:none;">自动语气：开</span></h2>
+    <h2>📚 批量转换 <span id="autoStyleBadge" class="badge" style="display:none;">自动语气：开</span></h2>
     <div class="row">
       <label>音色</label>
       <select id="voiceSelect"></select>
@@ -145,28 +164,38 @@
     </div>
     <div class="row">
       <label>文件</label>
-      <input type="file" id="fileInput" class="file-input" accept=".txt,.md">
+      <!-- multiple：支持一次多选上百个文件 -->
+      <input type="file" id="fileInput" class="file-input" accept=".txt,.md" multiple>
     </div>
     <div class="row">
       <label>或粘贴</label>
       <textarea id="textInput" placeholder="直接粘贴正文，与上传文件二选一"></textarea>
     </div>
     <div class="row">
-      <button id="convertBtn">开始转换</button>
-      <span class="hint">整章文本即可，系统自动拆句逐段合成</span>
+      <button id="convertBtn">加入队列</button>
+      <span class="hint">可多选上百个 txt/md 文件，按顺序自动转换；产物保存在 output/ 目录，不触发下载</span>
     </div>
-    <div class="progress-wrap" id="progressWrap">
+    <p class="hint" id="fileCountHint"></p>
+    <div class="progress-wrap">
       <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
-      <div class="status" id="statusText">准备就绪</div>
+      <div class="status" id="statusText">空闲</div>
+      <div class="queue-list" id="queueList"></div>
     </div>
+  </div>
+
+  <!-- 产物卡片 -->
+  <div class="card">
+    <h2>📁 产物（output/） <button class="ghost" id="refreshOutputBtn" style="margin-left:auto;">刷新</button></h2>
+    <div class="output-list" id="outputList"><span class="hint">暂无产物</span></div>
   </div>
 </div>
 
 <script>
 const $ = (id) => document.getElementById(id);
 let voices = [];
-let convertedFileName = 'storybook';
 let llmConfigured = false;
+// 上一轮轮询时队列是否活跃（用于队列清空后自动刷新产物列表）
+let lastQueueActive = false;
 
 // ---------- 状态加载 ----------
 async function loadStatus() {
@@ -306,61 +335,149 @@ $('autoStyleToggle').addEventListener('change', async (e) => {
   }
 });
 
-// ---------- 转换 ----------
+// ---------- 批量转换 ----------
+// 文件多选后展示数量提示
+$('fileInput').addEventListener('change', () => {
+  const n = $('fileInput').files.length;
+  $('fileCountHint').textContent = n ? `已选 ${n} 个文件，将按选择顺序入队转换` : '';
+});
+
 $('convertBtn').addEventListener('click', async () => {
-  const file = $('fileInput').files[0];
+  const files = Array.from($('fileInput').files);
   const pasted = $('textInput').value.trim();
-  if (!file && !pasted) { alert('请上传文件或粘贴文本'); return; }
+  if (!files.length && !pasted) { alert('请上传文件或粘贴文本'); return; }
 
   const voice = $('voiceSelect').value;
   const style = $('styleInput').value.trim();
-  // 自动语气开启时随请求下发（后端仍会校验 LLM 可用性，不可用则自动走旧流程）
+  // 自动语气开启时随请求下发（后端仍会校验 LLM 可用性，不可用则自动走规则拆句）
   const autoStyle = llmConfigured && $('autoStyleToggle').checked;
-  const form = new FormData();
-  form.append('voice', voice);
-  if (style) form.append('style', style);
-  if (autoStyle) form.append('autoStyle', 'true');
-  if (file) { form.append('file', file); convertedFileName = file.name; }
-  else { form.append('text', pasted); convertedFileName = 'pasted'; }
 
   $('convertBtn').disabled = true;
-  $('progressWrap').style.display = 'block';
-  $('progressBar').style.width = '0%';
-  $('statusText').textContent = '准备中…';
-
-  const url = file ? '/api/convert/file' : '/api/convert';
-  const timer = setInterval(pollProgress, 800);
   try {
-    const res = await fetch(url, { method: 'POST', body: form });
-    if (!res.ok) throw new Error((await res.json()).error || '转换失败');
-    const blob = await res.blob();
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = convertedFileName.replace(/\.(txt|md)$/i, '') + '.mp3';
-    a.click();
-    URL.revokeObjectURL(a.href);
-    $('statusText').textContent = '完成，已开始下载';
-    $('progressBar').style.width = '100%';
+    if (files.length) {
+      // 逐个上传入队：避免单请求体积过大，且可展示上传进度
+      for (let i = 0; i < files.length; i++) {
+        $('statusText').textContent = `上传入队 ${i + 1}/${files.length} · ${files[i].name}`;
+        const form = new FormData();
+        form.append('file', files[i]);
+        form.append('voice', voice);
+        if (style) form.append('style', style);
+        if (autoStyle) form.append('autoStyle', 'true');
+        const res = await fetch('/api/convert/file', { method: 'POST', body: form });
+        if (!res.ok) throw new Error((await res.json()).error || '入队失败');
+      }
+      $('statusText').textContent = `已入队 ${files.length} 个文件，等待转换`;
+    } else {
+      // 粘贴文本：走同一条队列
+      const res = await fetch('/api/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: pasted, voice, style, autoStyle }),
+      });
+      if (!res.ok) throw new Error((await res.json()).error || '入队失败');
+      $('statusText').textContent = '已入队，等待转换';
+    }
+    // 入队成功后清空输入，进度交给轮询展示
+    $('fileInput').value = '';
+    $('fileCountHint').textContent = '';
+    $('textInput').value = '';
   } catch (err) {
     $('statusText').textContent = '失败：' + err.message;
   } finally {
-    clearInterval(timer);
     $('convertBtn').disabled = false;
   }
 });
+
+// ---------- 轮询队列进度（常驻，队列列表与产物列表随之刷新） ----------
+setInterval(pollProgress, 1000);
 
 async function pollProgress() {
   try {
     const res = await fetch('/api/progress');
     const data = await res.json();
-    if (data.total > 0) {
-      $('progressBar').style.width = Math.round((data.done / data.total) * 100) + '%';
+
+    // 状态行：当前任务状态 + 队列统计（done/failed/pending 均为任务级）
+    const stats = data.tasks.length
+      ? `（完成 ${data.done} · 失败 ${data.failed} · 待处理 ${data.pending}）`
+      : '';
+    $('statusText').textContent = (data.status || '空闲') + stats;
+
+    // 整体进度条：按任务数；段级进度并入状态展示
+    const total = data.tasks.length;
+    const finished = data.done + data.failed;
+    $('progressBar').style.width = total ? Math.round((finished / total) * 100) + '%' : '0%';
+    if (data.segTotal > 0) {
+      $('statusText').textContent += ` 当前文件段进度 ${data.segDone}/${data.segTotal}`;
     }
-    $('statusText').textContent = data.status;
+
+    renderTasks(data.tasks);
+
+    // 队列从活跃转为空闲：说明刚有一批任务完成，刷新产物列表
+    const active = data.pending > 0 || data.tasks.some((t) => t.status === 'running');
+    if (lastQueueActive && !active) loadOutput();
+    lastQueueActive = active;
   } catch { /* 轮询失败忽略 */ }
 }
 
+/** 渲染队列任务列表（文件名用 textContent 防注入） */
+function renderTasks(tasks) {
+  const box = $('queueList');
+  box.style.display = tasks.length ? 'block' : 'none';
+  box.innerHTML = '';
+  const badgeText = { pending: '待处理', running: '转换中', done: '完成', failed: '失败' };
+  tasks.forEach((t) => {
+    const div = document.createElement('div');
+    div.className = 'task ' + t.status;
+    const badge = document.createElement('span');
+    badge.className = 'task-badge';
+    badge.textContent = badgeText[t.status] || t.status;
+    const name = document.createElement('span');
+    name.className = 'task-name';
+    name.textContent = t.filename + (t.error ? '：' + t.error : '');
+    div.append(badge, name);
+    box.appendChild(div);
+  });
+}
+
+// ---------- 产物列表 ----------
+$('refreshOutputBtn').addEventListener('click', loadOutput);
+
+async function loadOutput() {
+  try {
+    const res = await fetch('/api/output');
+    const data = await res.json();
+    const box = $('outputList');
+    box.innerHTML = '';
+    if (!data.files.length) {
+      box.innerHTML = '<span class="hint">暂无产物</span>';
+      return;
+    }
+    data.files.forEach((f) => {
+      const div = document.createElement('div');
+      div.className = 'output-item';
+      const name = document.createElement('span');
+      name.className = 'output-name';
+      name.textContent = f.name;
+      const size = document.createElement('span');
+      size.className = 'output-size';
+      size.textContent = fmtSize(f.size);
+      const link = document.createElement('a');
+      link.href = '/api/output/' + encodeURIComponent(f.name);
+      link.textContent = '下载';
+      div.append(name, size, link);
+      box.appendChild(div);
+    });
+  } catch { /* 加载失败忽略 */ }
+}
+
+/** 字节数 → 可读大小 */
+function fmtSize(n) {
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  return Math.max(1, Math.round(n / 1024)) + ' KB';
+}
+
 loadStatus();
+loadOutput();
 </script>
 </body>
 </html>
