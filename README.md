@@ -1,5 +1,9 @@
 # storybook-gen
 
+<p align="center">
+  <img src="public/icon.png" width="120" alt="storybook-gen 图标">
+</p>
+
 文本转有声书工具：上传 txt / md，自动拆句逐段合成，合并输出一个连贯的 mp3。
 
 区别于旧的 `ai-voice-storybook`（依赖本地 CosyVoice 大模型），本工具采用**可插拔 TTS provider** 架构：

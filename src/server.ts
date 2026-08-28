@@ -130,5 +130,11 @@ app.get('/', async (_req, reply) => {
   return reply.type('text/html').send(html);
 });
 
+// 浏览器标签页图标（favicon）
+app.get('/icon.png', async (_req, reply) => {
+  const icon = fs.readFileSync(path.join(PUBLIC_DIR, 'icon.png'));
+  return reply.type('image/png').send(icon);
+});
+
 await app.listen({ host: '0.0.0.0', port: PORT });
 console.log(`storybook-gen 已启动：http://localhost:${PORT}`);
