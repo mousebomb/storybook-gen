@@ -222,6 +222,7 @@ async function processQueue() {
       progress.done = 0;
       progress.total = 0;
       progress.status = `转换中 · ${task.filename}`;
+      console.log(`[转换] 开始：${task.filename}`);
       try {
         // 暂存文件读入内存后立即删除，控制暂存目录大小
         const text = fs.readFileSync(task.filePath, 'utf-8');
@@ -234,26 +235,42 @@ async function processQueue() {
             progress.done = done;
             progress.total = total;
             progress.status = `合成中 ${done}/${total} · ${task.filename}`;
+            logProgress(task.filename, done, total);
           },
           // LLM 拆解等阶段性状态（此时段级进度还没产生）
           onStatus: (msg) => {
             if (!progress.done) progress.status = `${msg} · ${task.filename}`;
+            console.log(`[状态] ${task.filename}：${msg}`);
           },
         });
         // 产物落盘 output/：挂机批量生成，客户端断开不丢
-        fs.writeFileSync(path.join(OUTPUT_DIR, toMp3Name(task.filename)), mp3);
+        const outName = toMp3Name(task.filename);
+        fs.writeFileSync(path.join(OUTPUT_DIR, outName), mp3);
         task.status = 'done';
+        console.log(`[完成] ${task.filename} → output/${outName}（${(mp3.length / 1024 / 1024).toFixed(1)} MB）`);
       } catch (err) {
         // 单任务失败不中断队列，挂机模式继续下一个
         task.status = 'failed';
         task.error = (err as Error).message;
+        console.error(`[失败] ${task.filename}：${task.error}`);
       }
     }
     progress.done = 0;
     progress.total = 0;
-    progress.status = queue.some((t) => t.status === 'failed') ? '队列完成（含失败任务）' : '队列完成';
+    const failed = queue.filter((t) => t.status === 'failed').length;
+    progress.status = failed ? '队列完成（含失败任务）' : '队列完成';
+    // 队列收尾汇总日志
+    const done = queue.filter((t) => t.status === 'done').length;
+    console.log(`[队列] 全部完成：成功 ${done} 个，失败 ${failed} 个`);
   } finally {
     workerRunning = false;
+  }
+}
+
+/** 段级进度控制台日志：每 10 段打印一次，最后一段必打（避免整本书刷屏） */
+function logProgress(filename: string, done: number, total: number) {
+  if (done === total || done % 10 === 0) {
+    console.log(`[进度] ${filename}：${done}/${total} 段`);
   }
 }
 
