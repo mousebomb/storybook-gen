@@ -6,9 +6,10 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getProvider, listProviders } from './providers';
 import { getEnv, getEnvNumber, saveEnv } from './config';
-import { textToAudio } from './pipeline';
+import { textToAudio, type SegmentFailInfo } from './pipeline';
 import { isLlmConfigured } from './llm';
-import { isRetryable } from './errors';
+import { ApiError, errorSummary, isRetryable } from './errors';
+import { FailureLog } from './errorlog';
 import { backoffDelay, sleep } from './retry';
 
 const PORT = Number(getEnv('PORT') ?? '5666');
@@ -54,6 +55,8 @@ interface ConvertTask {
   autoStyle?: boolean;
   status: 'pending' | 'running' | 'done' | 'failed';
   error?: string;
+  /** 失败原因的处理建议（来自 ApiError.detail.hint），WebUI 里辅助判断该不该重试 */
+  errorHint?: string;
   /** 已尝试次数（含首次），重排队后继续累加 */
   attempts: number;
   /** 已重排队次数，达到上限后不再重试 */
@@ -70,6 +73,14 @@ const TASK_RETRY_BASE_MS = getEnvNumber('TTS_TASK_RETRY_BASE_MS', 15_000);
 const TASK_RETRY_MAX_MS = getEnvNumber('TTS_TASK_RETRY_MAX_MS', 120_000);
 /** 队列只剩「未到重试时间」的任务时，worker 的轮询间隔（保证新入队任务能及时插队） */
 const IDLE_TICK_MS = 2_000;
+
+/**
+ * 失败日志整理器：同一类错误（同状态码 + 同错误体）在 30s 内只完整展开一次，
+ * 否则一本 200 段的书连续 500 会把控制台刷爆；连续失败到阈值还会给一次「接口疑似故障」的告警。
+ */
+const failures = new FailureLog({
+  outageWarnAfter: getEnvNumber('TTS_OUTAGE_WARN_AFTER', 5),
+});
 
 const queue: ConvertTask[] = [];
 /** worker 是否在跑（保证只有一个消费循环） */
@@ -148,6 +159,7 @@ app.get('/api/progress', async () => {
     filename: t.filename,
     status: t.status,
     error: t.error,
+    errorHint: t.errorHint,
     attempts: t.attempts,
     requeues: t.requeues,
     /** waiting 为 true 表示因 API 失败已重排队、正在等重试时间点 */
@@ -182,6 +194,7 @@ app.post('/api/queue/retry-failed', async () => {
     task.filePath = stageText(task.text);
     task.text = undefined;
     task.error = undefined;
+    task.errorHint = undefined;
     task.requeues = 0;
     task.notBefore = 0;
     task.status = 'pending';
@@ -312,6 +325,18 @@ async function processQueue() {
     // 队列收尾汇总日志
     const done = queue.filter((t) => t.status === 'done').length;
     console.log(`[队列] 全部完成：成功 ${done} 个，失败 ${failed} 个`);
+    if (failed > 0) {
+      // 失败原因分布：一眼看出「全是同一个故障」还是「零散问题」
+      const counts = new Map<string, number>();
+      for (const t of queue) {
+        if (t.status === 'failed' && t.error) counts.set(t.error, (counts.get(t.error) ?? 0) + 1);
+      }
+      const parts = [...counts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([msg, n]) => `${msg} × ${n}`);
+      console.warn(`[队列] 失败原因分布：${parts.join(' · ')}`);
+      console.warn('[队列] 失败任务的原文仍保留在内存中：点 WebUI 的「重试失败任务」即可补转，无需重新上传');
+    }
   } finally {
     workerRunning = false;
   }
@@ -335,6 +360,8 @@ async function runTask(task: ConvertTask) {
 
   // 暂存文件读入内存后立即删除，控制暂存目录大小；失败重排队时再落一份回去
   let text = '';
+  // 段级重试用尽的位置：最终失败的日志里要能看出「前几段已成功、卡在第几段」
+  let segFail: SegmentFailInfo | undefined;
   try {
     text = fs.readFileSync(task.filePath, 'utf-8');
     fs.rmSync(task.filePath, { force: true });
@@ -347,26 +374,32 @@ async function runTask(task: ConvertTask) {
         progress.total = total;
         progress.status = `合成中 ${done}/${total} · ${task.filename}`;
         logProgress(task.filename, done, total);
+        // 有一段成功就说明接口是通的：连续失败计数清零
+        failures.ok();
       },
       // LLM 拆解等阶段性状态（此时段级进度还没产生）
       onStatus: (msg) => {
         if (!progress.done) progress.status = `${msg} · ${task.filename}`;
         console.log(`[状态] ${task.filename}：${msg}`);
       },
-      // 段级重试：只影响当前这一段，整章不用从头再来
-      onSegmentRetry: ({ index, total, attempt, delayMs, error }) => {
+      // 段级重试：只影响当前这一段，整章不用从头再来。
+      // 同一类错误在日志里去重，首次出现时完整展开响应体/响应头/请求参数
+      onSegmentRetry: ({ index, total, attempt, delayMs, message, err }) => {
         progress.status = `段 ${index}/${total} 失败，${Math.round(delayMs / 1000)}s 后重试（第 ${attempt} 次） · ${task.filename}`;
-        console.warn(`[重试] ${task.filename} 第 ${index}/${total} 段第 ${attempt} 次尝试：${error}`);
+        console.warn(failures.fail(err, `[重试] ${task.filename} 第 ${index}/${total} 段第 ${attempt} 次尝试：${message}`));
       },
+      // 段级重试用尽：先记下位置，等抛到任务级失败处理时一并打印
+      onSegmentFail: (info) => { segFail = info; },
     });
     // 产物落盘 output/：挂机批量生成，客户端断开不丢
     const outName = toMp3Name(task.filename);
     fs.writeFileSync(path.join(OUTPUT_DIR, outName), mp3);
     task.status = 'done';
     task.error = undefined;
+    task.errorHint = undefined;
     console.log(`[完成] ${task.filename} → output/${outName}（${(mp3.length / 1024 / 1024).toFixed(1)} MB）`);
   } catch (err) {
-    requeueOrFail(task, err, text);
+    requeueOrFail(task, err, text, segFail);
   }
 }
 
@@ -374,9 +407,15 @@ async function runTask(task: ConvertTask) {
  * 失败处理：只有「API 侧故障」（限流/超时/5xx/空响应）才自动排到队尾重试；
  * 本地原因（缺 Key、ffmpeg 未装、文件读不到）重试再多次也一样，直接判失败。
  */
-function requeueOrFail(task: ConvertTask, err: unknown, text: string) {
-  const message = err instanceof Error ? err.message : String(err);
+function requeueOrFail(task: ConvertTask, err: unknown, text: string, segFail?: SegmentFailInfo) {
+  const message = errorSummary(err);
   task.error = message;
+  task.errorHint = err instanceof ApiError ? err.detail.hint : undefined;
+
+  // 失败位置：说明整章卡在哪一段、前面已经成了多少（重排队不必怀疑已成功的部分）
+  const where = segFail
+    ? `卡在 ${segFail.index}/${segFail.total} 段，前 ${segFail.done} 段已合成`
+    : undefined;
 
   if (isRetryable(err) && task.requeues + 1 < TASK_ATTEMPTS) {
     task.requeues += 1;
@@ -386,10 +425,9 @@ function requeueOrFail(task: ConvertTask, err: unknown, text: string) {
     // 原文在读入时已删除，重排队前重新落一份暂存，保证重试时还能读到
     if (text) task.filePath = stageText(text);
     moveToTail(task);
-    console.warn(
-      `[重试] ${task.filename} 已排到队尾（第 ${task.requeues}/${TASK_ATTEMPTS - 1} 次重排队，`
-      + `${Math.round(delayMs / 1000)}s 后可执行）：${message}`,
-    );
+    const ctx = `[重试] ${task.filename} 已排到队尾（第 ${task.requeues}/${TASK_ATTEMPTS - 1} 次重排队，`
+      + `${Math.round(delayMs / 1000)}s 后可执行${where ? `；${where}` : ''}）`;
+    console.warn(failures.fail(err, ctx));
     return;
   }
 
@@ -399,7 +437,12 @@ function requeueOrFail(task: ConvertTask, err: unknown, text: string) {
   const reason = isRetryable(err)
     ? `API 侧失败，重排队 ${task.requeues} 次仍未成功`
     : '本地/配置原因，不自动重试';
-  console.error(`[失败] ${task.filename}（${reason}）：${message}`);
+  // 最终失败强制完整展开细节：这是整轮跑完后最需要看的现场，不参与去重
+  console.error(failures.fail(
+    err,
+    `[失败] ${task.filename}（${reason}${where ? `；${where}` : ''}）`,
+    { force: true },
+  ));
 }
 
 /** 把任务移到队列末尾：本轮剩余文件先转完，等重试时间点再回到它 */

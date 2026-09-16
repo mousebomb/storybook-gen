@@ -12,7 +12,20 @@ export interface SegmentRetryInfo {
   total: number;
   attempt: number;
   delayMs: number;
-  error: string;
+  /** 失败原因一句话摘要（用于状态行与单行日志） */
+  message: string;
+  /** 原始错误对象：日志据此展开完整诊断（响应体、响应头、请求参数） */
+  err: unknown;
+}
+
+/** 某一段用尽重试后彻底失败：整章会被抛给队列重排队，这里说明卡在哪、前面成了多少 */
+export interface SegmentFailInfo {
+  /** 失败段序号（从 1 起） */
+  index: number;
+  total: number;
+  /** 该段之前已合成成功的段数 */
+  done: number;
+  err: unknown;
 }
 
 export interface PipelineOptions {
@@ -29,6 +42,8 @@ export interface PipelineOptions {
   onStatus?: (msg: string) => void;
   /** 单段合成失败、就地重试前的回调（段级重试在管线内消化，不会牵连整章） */
   onSegmentRetry?: (info: SegmentRetryInfo) => void;
+  /** 单段重试用尽、整章即将失败的回调；日志靠它说明卡在第几段 */
+  onSegmentFail?: (info: SegmentFailInfo) => void;
 }
 
 export async function textToAudio(
@@ -55,27 +70,35 @@ export async function textToAudio(
   const retryOpts = segmentRetryOptions();
   const audios: Buffer[] = [];
   for (let i = 0; i < segments.length; i++) {
-    const buf = await withRetry(
-      () => provider.synthesize({
-        text: segments[i].text,
-        voice: opts.voice,
-        speed: opts.speed,
-        // 段级语气指令优先，全局 style 兜底
-        style: segments[i].instruct ?? opts.style,
-      }),
-      {
-        ...retryOpts,
-        onRetry: (err, attempt, delayMs) => {
-          opts.onSegmentRetry?.({
-            index: i + 1,
-            total: segments.length,
-            attempt,
-            delayMs,
-            error: err.message,
-          });
+    let buf: Buffer;
+    try {
+      buf = await withRetry(
+        () => provider.synthesize({
+          text: segments[i].text,
+          voice: opts.voice,
+          speed: opts.speed,
+          // 段级语气指令优先，全局 style 兜底
+          style: segments[i].instruct ?? opts.style,
+        }),
+        {
+          ...retryOpts,
+          onRetry: (err, attempt, delayMs) => {
+            opts.onSegmentRetry?.({
+              index: i + 1,
+              total: segments.length,
+              attempt,
+              delayMs,
+              message: err.message,
+              err,
+            });
+          },
         },
-      },
-    );
+      );
+    } catch (err) {
+      // 段级重试用尽：把失败位置一并报上去，日志里能看出「前 i 段已成功、卡在第 i+1 段」
+      opts.onSegmentFail?.({ index: i + 1, total: segments.length, done: i, err });
+      throw err;
+    }
     audios.push(buf);
     opts.onProgress?.(i + 1, segments.length);
   }
