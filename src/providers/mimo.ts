@@ -1,4 +1,5 @@
-import { getEnv } from '../config';
+import { getEnv, getEnvNumber } from '../config';
+import { ApiError, apiErrorFromNetwork, apiErrorFromResponse } from '../errors';
 import type { TTSProvider, VoiceOption, SynthesizeOptions } from './types';
 
 const BASE_URL = 'https://api.xiaomimimo.com/v1/chat/completions';
@@ -38,7 +39,7 @@ export class MimoProvider implements TTSProvider {
     if (!apiKey) throw new Error('未配置 MIMO_API_KEY，请先在 WebUI 设置中填写 API Key');
 
     const style = opts.style?.trim() || DEFAULT_STYLE;
-    const res = await fetch(BASE_URL, {
+    const res = await request(BASE_URL, {
       method: 'POST',
       headers: {
         'api-key': apiKey,
@@ -61,20 +62,35 @@ export class MimoProvider implements TTSProvider {
       }),
     });
 
-    if (!res.ok) {
-      let msg = `HTTP ${res.status}`;
-      try {
-        const err = await res.json() as { error?: { message?: string } };
-        if (err?.error?.message) msg = err.error.message;
-      } catch { /* 忽略解析失败 */ }
-      throw new Error(`MiMo TTS 失败：${msg}`);
-    }
+    // 状态码分类交给 errors.ts：429/5xx 可重试，400/401 等重试无意义
+    if (!res.ok) throw await apiErrorFromResponse('MiMo TTS 失败', res);
 
-    const data = await res.json() as {
-      choices?: Array<{ message?: { audio?: { data?: string } } }>;
-    };
+    let data: { choices?: Array<{ message?: { audio?: { data?: string } } }> };
+    try {
+      data = await res.json() as typeof data;
+    } catch (err) {
+      throw new ApiError('MiMo TTS 响应不是合法 JSON', { retryable: true, cause: err });
+    }
     const b64 = data?.choices?.[0]?.message?.audio?.data;
-    if (!b64) throw new Error('MiMo TTS 响应中没有音频数据');
+    // 接口偶发返回 200 但不带音频（限流/排队被吞），属于可重试情况
+    if (!b64) throw new ApiError('MiMo TTS 响应中没有音频数据', { retryable: true });
     return Buffer.from(b64, 'base64');
+  }
+}
+
+/**
+ * 带超时的请求：接口偶发挂死时不能把整个队列卡住，
+ * 超时与网络层失败一并归为 API 侧可重试故障。
+ */
+async function request(url: string, init: RequestInit): Promise<Response> {
+  const timeoutMs = getEnvNumber('MIMO_TIMEOUT_MS', 120_000);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error(`请求超时（${Math.round(timeoutMs / 1000)}s）`)), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } catch (err) {
+    throw apiErrorFromNetwork('MiMo TTS 请求失败', err);
+  } finally {
+    clearTimeout(timer);
   }
 }

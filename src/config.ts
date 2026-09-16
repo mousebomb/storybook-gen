@@ -15,6 +15,14 @@ export function getEnv(key: string): string | undefined {
   return process.env[key] ?? loadEnv()[key];
 }
 
+/** 读取数值型配置项：缺失或非法时回落到默认值（重试策略等参数用） */
+export function getEnvNumber(key: string, fallback: number): number {
+  const raw = getEnv(key);
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 /**
  * 写回 .env：保留原有注释与无关键，仅更新指定键的值；
  * 不存在的键追加到文件末尾。API Key 存这里而非硬编码到源码。

@@ -77,6 +77,9 @@
   .task.running .task-badge { background: var(--accent-soft); color: var(--accent); }
   .task.done .task-badge { background: #e4efe7; color: var(--ok); }
   .task.failed .task-badge { background: #f6e3df; color: var(--err); }
+  /* 待重试：已排到队尾等重试时间点 */
+  .task.retry .task-name { color: #a5762a; }
+  .task.retry .task-badge { background: #fbf1dc; color: #a5762a; }
   /* 产物列表 */
   .output-list { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
   .output-item { display: flex; align-items: baseline; gap: 10px; font-size: 13px; }
@@ -173,12 +176,16 @@
     </div>
     <div class="row">
       <button id="convertBtn">加入队列</button>
-      <span class="hint">可多选上百个 txt/md 文件，按顺序自动转换；产物保存在 output/ 目录，不触发下载</span>
+      <span class="hint">可多选上百个 txt/md 文件，按顺序自动转换；接口原因（限流/超时）导致的失败会自动排到队尾重试；产物保存在 output/ 目录，不触发下载</span>
     </div>
     <p class="hint" id="fileCountHint"></p>
     <div class="progress-wrap">
       <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
       <div class="status" id="statusText">空闲</div>
+      <div class="row" id="retryRow" style="display:none;margin-top:10px;">
+        <button class="ghost" id="retryFailedBtn">重试失败任务</button>
+        <span class="hint" id="retryHint" style="margin-top:0;"></span>
+      </div>
       <div class="queue-list" id="queueList"></div>
     </div>
   </div>
@@ -397,9 +404,9 @@ async function pollProgress() {
     const data = await res.json();
 
     // 状态行：当前任务状态 + 队列统计（done/failed/pending 均为任务级）
-    const stats = data.tasks.length
-      ? `（完成 ${data.done} · 失败 ${data.failed} · 待处理 ${data.pending}）`
-      : '';
+    const parts = [`完成 ${data.done}`, `失败 ${data.failed}`, `待处理 ${data.pending}`];
+    if (data.retrying) parts.push(`待重试 ${data.retrying}`); // 因接口失败已排到队尾的任务
+    const stats = data.tasks.length ? `（${parts.join(' · ')}）` : '';
     $('statusText').textContent = (data.status || '空闲') + stats;
 
     // 整体进度条：按任务数；段级进度并入状态展示
@@ -410,7 +417,11 @@ async function pollProgress() {
       $('statusText').textContent += ` 当前文件段进度 ${data.segDone}/${data.segTotal}`;
     }
 
-    renderTasks(data.tasks);
+    renderTasks(data.tasks, data.maxRequeues);
+
+    // 有失败任务时才显示「重试失败任务」（失败任务保留了原文，可重新排队补转）
+    $('retryRow').style.display = data.failed > 0 ? 'flex' : 'none';
+    $('retryHint').textContent = data.failed > 0 ? `${data.failed} 个失败任务可重新排队补转` : '';
 
     // 队列从活跃转为空闲：说明刚有一批任务完成，刷新产物列表
     const active = data.pending > 0 || data.tasks.some((t) => t.status === 'running');
@@ -420,24 +431,44 @@ async function pollProgress() {
 }
 
 /** 渲染队列任务列表（文件名用 textContent 防注入） */
-function renderTasks(tasks) {
+function renderTasks(tasks, maxRequeues) {
   const box = $('queueList');
   box.style.display = tasks.length ? 'block' : 'none';
   box.innerHTML = '';
   const badgeText = { pending: '待处理', running: '转换中', done: '完成', failed: '失败' };
   tasks.forEach((t) => {
     const div = document.createElement('div');
-    div.className = 'task ' + t.status;
+    // waiting：因接口失败已排到队尾，正等重试时间点
+    div.className = 'task ' + (t.waiting ? 'retry' : t.status);
     const badge = document.createElement('span');
     badge.className = 'task-badge';
-    badge.textContent = badgeText[t.status] || t.status;
+    badge.textContent = t.waiting ? '待重试' : (badgeText[t.status] || t.status);
     const name = document.createElement('span');
     name.className = 'task-name';
-    name.textContent = t.filename + (t.error ? '：' + t.error : '');
+    let label = t.filename;
+    if (t.waiting) label += `（重试 ${t.requeues}/${maxRequeues}，已排到队尾）`;
+    if (t.error) label += '：' + t.error;
+    name.textContent = label;
     div.append(badge, name);
     box.appendChild(div);
   });
 }
+
+// ---------- 手动补转失败的队列任务 ----------
+$('retryFailedBtn').addEventListener('click', async () => {
+  $('retryFailedBtn').disabled = true;
+  try {
+    const res = await fetch('/api/queue/retry-failed', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '补转失败');
+    $('statusText').textContent = `已把 ${data.requeued} 个失败任务重新排到队尾`
+      + (data.skipped ? `，${data.skipped} 个无原文需重新上传` : '');
+  } catch (err) {
+    alert('补转失败：' + err.message);
+  } finally {
+    $('retryFailedBtn').disabled = false;
+  }
+});
 
 // ---------- 产物列表 ----------
 $('refreshOutputBtn').addEventListener('click', loadOutput);

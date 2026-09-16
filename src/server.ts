@@ -5,9 +5,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getProvider, listProviders } from './providers';
-import { getEnv, saveEnv } from './config';
+import { getEnv, getEnvNumber, saveEnv } from './config';
 import { textToAudio } from './pipeline';
 import { isLlmConfigured } from './llm';
+import { isRetryable } from './errors';
+import { backoffDelay, sleep } from './retry';
 
 const PORT = Number(getEnv('PORT') ?? '5666');
 const PUBLIC_DIR = path.join(process.cwd(), 'public');
@@ -19,6 +21,21 @@ const STAGING_DIR = path.join(OUTPUT_DIR, '.tmp');
 // bodyLimit 调大到 100MB：单本小说 txt 可能超过默认 20MB
 const app = Fastify({ bodyLimit: 100 * 1024 * 1024 });
 await app.register(multipart);
+
+// 自定义 JSON 解析：空 body 视为 {}。
+// 否则「带 Content-Type: application/json 但不带 body」的请求（如 curl -X POST 调
+// /api/queue/retry-failed）会被 Fastify 以 FST_ERR_CTP_EMPTY_JSON_BODY 拒掉。
+app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
+  const raw = (body as string) ?? '';
+  if (raw.trim() === '') return done(null, {});
+  try {
+    done(null, JSON.parse(raw));
+  } catch (err) {
+    const e = err as Error & { statusCode?: number };
+    e.statusCode = 400;
+    done(e, undefined);
+  }
+});
 
 // 启动时清空暂存目录：队列仅存内存，重启后残留的上传文件已无对应任务
 fs.rmSync(STAGING_DIR, { recursive: true, force: true });
@@ -37,7 +54,22 @@ interface ConvertTask {
   autoStyle?: boolean;
   status: 'pending' | 'running' | 'done' | 'failed';
   error?: string;
+  /** 已尝试次数（含首次），重排队后继续累加 */
+  attempts: number;
+  /** 已重排队次数，达到上限后不再重试 */
+  requeues: number;
+  /** 最早可执行时间（毫秒时间戳），重排队后的退避等待用；0 表示立即可执行 */
+  notBefore: number;
+  /** 最终失败时保留原文，供「重试失败任务」补转；正常完成的文件不留（省内存） */
+  text?: string;
 }
+
+/** 任务级重试策略：整章因 API 侧失败后重新排到队尾等待重试（参数见 .env.example） */
+const TASK_ATTEMPTS = Math.max(1, Math.floor(getEnvNumber('TTS_TASK_ATTEMPTS', 4)));
+const TASK_RETRY_BASE_MS = getEnvNumber('TTS_TASK_RETRY_BASE_MS', 15_000);
+const TASK_RETRY_MAX_MS = getEnvNumber('TTS_TASK_RETRY_MAX_MS', 120_000);
+/** 队列只剩「未到重试时间」的任务时，worker 的轮询间隔（保证新入队任务能及时插队） */
+const IDLE_TICK_MS = 2_000;
 
 const queue: ConvertTask[] = [];
 /** worker 是否在跑（保证只有一个消费循环） */
@@ -111,7 +143,16 @@ app.post('/api/config/autostyle', async (req, reply) => {
 
 // 进度与队列状态查询：前端轮询渲染（done/failed/pending 为任务级统计）
 app.get('/api/progress', async () => {
-  const tasks = queue.map(({ id, filename, status, error }) => ({ id, filename, status, error }));
+  const tasks = queue.map((t) => ({
+    id: t.id,
+    filename: t.filename,
+    status: t.status,
+    error: t.error,
+    attempts: t.attempts,
+    requeues: t.requeues,
+    /** waiting 为 true 表示因 API 失败已重排队、正在等重试时间点 */
+    waiting: t.status === 'pending' && t.requeues > 0,
+  }));
   return {
     status: progress.status,
     segDone: progress.done,
@@ -119,8 +160,37 @@ app.get('/api/progress', async () => {
     pending: tasks.filter((t) => t.status === 'pending').length,
     done: tasks.filter((t) => t.status === 'done').length,
     failed: tasks.filter((t) => t.status === 'failed').length,
+    /** 已重排队等待重试的任务数 */
+    retrying: tasks.filter((t) => t.waiting).length,
+    /** 单任务最多重排队次数（WebUI 展示「重试 n/N」用） */
+    maxRequeues: TASK_ATTEMPTS - 1,
     tasks,
   };
+});
+
+// 手动补转所有失败任务：重新排到队尾（复用失败时保留的原文），
+// 用于修好配置（如换 Key）或接口恢复后把没转完的补齐
+app.post('/api/queue/retry-failed', async () => {
+  const requeued: string[] = [];
+  const skipped: string[] = [];
+  for (const task of queue.filter((t) => t.status === 'failed')) {
+    if (!task.text) {
+      // 原文没保留（例如读暂存文件就失败了），只能重新上传
+      skipped.push(task.filename);
+      continue;
+    }
+    task.filePath = stageText(task.text);
+    task.text = undefined;
+    task.error = undefined;
+    task.requeues = 0;
+    task.notBefore = 0;
+    task.status = 'pending';
+    moveToTail(task);
+    requeued.push(task.filename);
+  }
+  if (requeued.length) void processQueue();
+  console.log(`[补转] 重新入队 ${requeued.length} 个失败任务，${skipped.length} 个无原文跳过`);
+  return { ok: true, requeued: requeued.length, skipped: skipped.length };
 });
 
 // JSON 文本转换：正文写入暂存后入队（与文件上传走同一条队列，不回传 mp3）
@@ -203,57 +273,37 @@ app.get('/api/output/:name', async (req, reply) => {
 
 /** 入队一个转换任务并确保 worker 在跑 */
 function enqueueTask(t: Pick<ConvertTask, 'filename' | 'filePath' | 'voice' | 'style' | 'autoStyle'>) {
-  const task: ConvertTask = { ...t, id: randomUUID().slice(0, 8), status: 'pending' };
+  const task: ConvertTask = {
+    ...t,
+    id: randomUUID().slice(0, 8),
+    status: 'pending',
+    attempts: 0,
+    requeues: 0,
+    notBefore: 0,
+  };
   queue.push(task);
   void processQueue();
   return task;
 }
 
-/** 队列消费循环：串行处理所有 pending 任务，全部处理完后退出 */
+/**
+ * 队列消费循环：串行处理所有 pending 任务，全部处理完后退出。
+ * 失败任务若属 API 侧原因，会被重新排到队尾并带上退避时间，
+ * 因此这里取任务时要跳过「还没到重试时间」的，等时间到了再接着转。
+ */
 async function processQueue() {
   if (workerRunning) return;
   workerRunning = true;
   try {
     while (true) {
-      // 取最早的 pending 任务（入队顺序即执行顺序）
-      const task = queue.find((t) => t.status === 'pending');
-      if (!task) break;
-      task.status = 'running';
-      progress.done = 0;
-      progress.total = 0;
-      progress.status = `转换中 · ${task.filename}`;
-      console.log(`[转换] 开始：${task.filename}`);
-      try {
-        // 暂存文件读入内存后立即删除，控制暂存目录大小
-        const text = fs.readFileSync(task.filePath, 'utf-8');
-        fs.rmSync(task.filePath, { force: true });
-        const mp3 = await textToAudio(getProvider(), text, {
-          voice: task.voice,
-          style: task.style,
-          autoStyle: task.autoStyle,
-          onProgress: (done, total) => {
-            progress.done = done;
-            progress.total = total;
-            progress.status = `合成中 ${done}/${total} · ${task.filename}`;
-            logProgress(task.filename, done, total);
-          },
-          // LLM 拆解等阶段性状态（此时段级进度还没产生）
-          onStatus: (msg) => {
-            if (!progress.done) progress.status = `${msg} · ${task.filename}`;
-            console.log(`[状态] ${task.filename}：${msg}`);
-          },
-        });
-        // 产物落盘 output/：挂机批量生成，客户端断开不丢
-        const outName = toMp3Name(task.filename);
-        fs.writeFileSync(path.join(OUTPUT_DIR, outName), mp3);
-        task.status = 'done';
-        console.log(`[完成] ${task.filename} → output/${outName}（${(mp3.length / 1024 / 1024).toFixed(1)} MB）`);
-      } catch (err) {
-        // 单任务失败不中断队列，挂机模式继续下一个
-        task.status = 'failed';
-        task.error = (err as Error).message;
-        console.error(`[失败] ${task.filename}：${task.error}`);
+      const task = nextReadyTask();
+      if (!task) {
+        // 队列里只剩等重试的任务：小睡一轮再检查（期间可能又有新文件入队，能及时插队）
+        if (!queue.some((t) => t.status === 'pending')) break;
+        await sleep(IDLE_TICK_MS);
+        continue;
       }
+      await runTask(task);
     }
     progress.done = 0;
     progress.total = 0;
@@ -265,6 +315,98 @@ async function processQueue() {
   } finally {
     workerRunning = false;
   }
+}
+
+/** 取下一个可执行任务：入队顺序优先，未到重试时间点的任务先跳过 */
+function nextReadyTask(): ConvertTask | undefined {
+  const now = Date.now();
+  return queue.find((t) => t.status === 'pending' && t.notBefore <= now);
+}
+
+/** 执行单个任务：合成成功则落盘，失败交给 requeueOrFail 决定是重排队还是判失败 */
+async function runTask(task: ConvertTask) {
+  task.status = 'running';
+  task.attempts += 1;
+  progress.done = 0;
+  progress.total = 0;
+  progress.status = `转换中 · ${task.filename}`;
+  const suffix = task.requeues ? `（第 ${task.requeues + 1} 次尝试）` : '';
+  console.log(`[转换] 开始：${task.filename}${suffix}`);
+
+  // 暂存文件读入内存后立即删除，控制暂存目录大小；失败重排队时再落一份回去
+  let text = '';
+  try {
+    text = fs.readFileSync(task.filePath, 'utf-8');
+    fs.rmSync(task.filePath, { force: true });
+    const mp3 = await textToAudio(getProvider(), text, {
+      voice: task.voice,
+      style: task.style,
+      autoStyle: task.autoStyle,
+      onProgress: (done, total) => {
+        progress.done = done;
+        progress.total = total;
+        progress.status = `合成中 ${done}/${total} · ${task.filename}`;
+        logProgress(task.filename, done, total);
+      },
+      // LLM 拆解等阶段性状态（此时段级进度还没产生）
+      onStatus: (msg) => {
+        if (!progress.done) progress.status = `${msg} · ${task.filename}`;
+        console.log(`[状态] ${task.filename}：${msg}`);
+      },
+      // 段级重试：只影响当前这一段，整章不用从头再来
+      onSegmentRetry: ({ index, total, attempt, delayMs, error }) => {
+        progress.status = `段 ${index}/${total} 失败，${Math.round(delayMs / 1000)}s 后重试（第 ${attempt} 次） · ${task.filename}`;
+        console.warn(`[重试] ${task.filename} 第 ${index}/${total} 段第 ${attempt} 次尝试：${error}`);
+      },
+    });
+    // 产物落盘 output/：挂机批量生成，客户端断开不丢
+    const outName = toMp3Name(task.filename);
+    fs.writeFileSync(path.join(OUTPUT_DIR, outName), mp3);
+    task.status = 'done';
+    task.error = undefined;
+    console.log(`[完成] ${task.filename} → output/${outName}（${(mp3.length / 1024 / 1024).toFixed(1)} MB）`);
+  } catch (err) {
+    requeueOrFail(task, err, text);
+  }
+}
+
+/**
+ * 失败处理：只有「API 侧故障」（限流/超时/5xx/空响应）才自动排到队尾重试；
+ * 本地原因（缺 Key、ffmpeg 未装、文件读不到）重试再多次也一样，直接判失败。
+ */
+function requeueOrFail(task: ConvertTask, err: unknown, text: string) {
+  const message = err instanceof Error ? err.message : String(err);
+  task.error = message;
+
+  if (isRetryable(err) && task.requeues + 1 < TASK_ATTEMPTS) {
+    task.requeues += 1;
+    const delayMs = backoffDelay(task.requeues, TASK_RETRY_BASE_MS, TASK_RETRY_MAX_MS);
+    task.status = 'pending';
+    task.notBefore = Date.now() + delayMs;
+    // 原文在读入时已删除，重排队前重新落一份暂存，保证重试时还能读到
+    if (text) task.filePath = stageText(text);
+    moveToTail(task);
+    console.warn(
+      `[重试] ${task.filename} 已排到队尾（第 ${task.requeues}/${TASK_ATTEMPTS - 1} 次重排队，`
+      + `${Math.round(delayMs / 1000)}s 后可执行）：${message}`,
+    );
+    return;
+  }
+
+  task.status = 'failed';
+  // 保留原文，供 WebUI「重试失败任务」补转（仅失败任务，占内存有限）
+  if (text) task.text = text;
+  const reason = isRetryable(err)
+    ? `API 侧失败，重排队 ${task.requeues} 次仍未成功`
+    : '本地/配置原因，不自动重试';
+  console.error(`[失败] ${task.filename}（${reason}）：${message}`);
+}
+
+/** 把任务移到队列末尾：本轮剩余文件先转完，等重试时间点再回到它 */
+function moveToTail(task: ConvertTask) {
+  const idx = queue.indexOf(task);
+  if (idx !== -1) queue.splice(idx, 1);
+  queue.push(task);
 }
 
 /** 段级进度控制台日志：每 10 段打印一次，最后一段必打（避免整本书刷屏） */
